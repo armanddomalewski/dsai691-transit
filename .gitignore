@@ -1,0 +1,12 @@
+# secrets — never commit
+.env
+
+# source data: 600 MB archive and the CSVs extracted from it.
+# Re-download with the URL in create_and_load.sql instead.
+*.zip
+*.txt
+
+# local noise
+.DS_Store
+.vscode/
+__pycache__/
