@@ -687,3 +687,456 @@ SELECT r.route_short_name,
 HAVING COUNT(*) > 20000
  ORDER BY p90_delay_min DESC
  LIMIT 15;
+
+
+-- =============================================================================
+-- SECTION 8 — dashboard layer: metric definitions and pre-aggregated rollups
+--
+-- Reliability panels 1–5.
+--
+-- Metabase runs every panel query live, and a percentile over 25.8 M rows takes
+-- far too long for a dashboard. So the expensive work happens here, once, at
+-- build time, and the panel queries in Section 9 read small materialized views.
+--
+-- A percentile cannot be re-aggregated: a route's p90 is not any combination of
+-- the p90s of its hours. So each view is built at exactly the grain its panel
+-- displays, and raw counts are stored alongside so that percentages, unlike
+-- percentiles, CAN be rolled up further.
+--
+-- This section can be run on its own against an already-loaded database,
+-- without repeating the load:
+--
+--     sed -n '/^-- SECTION 8/,$p' create_and_load.sql \
+--       | docker exec -i postgres psql -U transit -d transit
+--
+-- Metric definitions. PROPOSED — to be confirmed by the group. Every one of
+-- them lives in obs_dashboard below, so changing a definition means changing
+-- it in one place and re-running this section.
+--
+--   scored       schedule_relationship = 0 and delay_secs present. The only
+--                rows any delay statistic is computed from.
+--   on time      between 1 minute early and 4 minutes late (-60 to +240 s),
+--                SFMTA's on-time standard.
+--   statistics   median and p90, both. Rankings use p90: riders plan around
+--                the bad days, not the typical one.
+--   hour         clock hour of the SCHEDULED arrival, 0–23. Feed times past
+--                24:00:00 are folded back by building a real timestamp first.
+--   day type     weekday / weekend, from service_date. A 00:30 trip on Friday
+--                night's service belongs to Friday, which is how agencies
+--                schedule it and how the feed records it.
+--   period       weekday AM peak 06–09, midday 09–16, PM peak 16–19,
+--                evening 19–24, overnight 00–06. Weekends are their own period.
+--   unobserved   cancelled stops (schedule_relationship = 3) and scheduled
+--                stops with no observed arrival are counted and reported as
+--                their own rates, never folded into delay.
+--   bunching     a bus arriving less than half the scheduled headway behind
+--                the one ahead; a gap is more than 1.5x the scheduled headway.
+--                Scored only on frequent service (scheduled headway 1–15 min):
+--                on a 30-minute route riders time their trip to the timetable,
+--                so schedule adherence matters there, not headway.
+--   agencies     not filtered here. Which agencies to trust is the quality
+--                audit's call (panel 9); panels filter on agency_id.
+-- =============================================================================
+
+-- The SET in Section 7 lasts only for the psql session that ran this script.
+-- Metabase opens its own connections and would still get the 4 MB default.
+-- ALTER DATABASE makes 256 MB the default for every new connection; already-
+-- open connections keep the old value until they reconnect.
+ALTER DATABASE transit SET work_mem = '256MB';
+SET work_mem = '256MB';
+
+DROP MATERIALIZED VIEW IF EXISTS mv_stop_delay;
+DROP MATERIALIZED VIEW IF EXISTS mv_headway;
+DROP MATERIALIZED VIEW IF EXISTS mv_daily_agency;
+DROP MATERIALIZED VIEW IF EXISTS mv_route_hour;
+DROP MATERIALIZED VIEW IF EXISTS mv_route_summary;
+DROP VIEW              IF EXISTS obs_dashboard;
+
+
+-- -----------------------------------------------------------------------------
+-- obs_dashboard — every observation, with the metric definitions applied.
+--
+-- A plain view, not materialized: it costs nothing to store, and every rollup
+-- below reads through it, so the definitions exist exactly once.
+--
+-- No row filter. The rollups need cancelled and unobserved rows too, to report
+-- them as rates, so they select scored rows with FILTER (WHERE scored) instead.
+-- -----------------------------------------------------------------------------
+
+CREATE VIEW obs_dashboard AS
+SELECT o.agency_id,
+       o.route_id,
+       o.feed_version,
+       o.direction_id,
+       o.to_stop_id,
+       o.service_date,
+       o.schedule_relationship,
+       o.scheduled_arrival_time,
+       o.observed_arrival_time,
+       o.delay_secs,
+
+       (o.schedule_relationship = 0 AND o.delay_secs IS NOT NULL)  AS scored,
+       (o.delay_secs BETWEEN -60 AND 240)                          AS on_time,
+
+       -- date + interval is a timestamp, so 24:30:00 on Aug 7 becomes
+       -- 00:30 on Aug 8 and the hour comes out as 0, not 24.
+       EXTRACT(HOUR FROM o.service_date + o.scheduled_arrival_time)::INTEGER
+                                                                   AS sched_hour,
+
+       CASE WHEN EXTRACT(ISODOW FROM o.service_date) IN (6, 7)
+            THEN 'weekend' ELSE 'weekday' END                      AS day_type,
+
+       CASE WHEN EXTRACT(ISODOW FROM o.service_date) IN (6, 7)  THEN 'weekend'
+            WHEN EXTRACT(HOUR FROM o.service_date + o.scheduled_arrival_time)
+                 BETWEEN 6 AND 8                                 THEN 'AM peak'
+            WHEN EXTRACT(HOUR FROM o.service_date + o.scheduled_arrival_time)
+                 BETWEEN 9 AND 15                                THEN 'midday'
+            WHEN EXTRACT(HOUR FROM o.service_date + o.scheduled_arrival_time)
+                 BETWEEN 16 AND 18                               THEN 'PM peak'
+            WHEN EXTRACT(HOUR FROM o.service_date + o.scheduled_arrival_time)
+                 BETWEEN 19 AND 23                               THEN 'evening'
+            ELSE 'overnight' END                                   AS period
+  FROM stop_observations o;
+
+
+-- -----------------------------------------------------------------------------
+-- mv_route_summary — one row per route x day type.
+-- Feeds panel 1 (leaderboard), and supplies route labels to panels 2 and 4.
+--
+-- Cancellations sit next to delay deliberately. A route can look reliable by
+-- delay alone because its worst trips never ran, and the delay columns cannot
+-- show that.
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_route_summary AS
+SELECT d.agency_id,
+       a.agency_name,
+       d.route_id,
+       d.feed_version,
+       COALESCE(r.route_short_name, r.route_long_name, d.route_id)  AS route_label,
+       r.route_type,
+       d.day_type,
+
+       COUNT(*) FILTER (WHERE d.scored)                             AS observations,
+       COUNT(*) FILTER (WHERE d.schedule_relationship = 3)          AS cancelled,
+       COUNT(*) FILTER (WHERE d.schedule_relationship = 0
+                          AND d.delay_secs IS NULL)                 AS unobserved,
+
+       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.delay_secs)
+              FILTER (WHERE d.scored))::NUMERIC / 60.0, 1)          AS median_delay_min,
+       ROUND((PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY d.delay_secs)
+              FILTER (WHERE d.scored))::NUMERIC / 60.0, 1)          AS p90_delay_min,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE d.scored AND d.on_time)
+             / NULLIF(COUNT(*) FILTER (WHERE d.scored), 0), 1)      AS pct_on_time,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE d.schedule_relationship = 3)
+             / NULLIF(COUNT(*) FILTER (
+                      WHERE d.schedule_relationship IN (0, 3)), 0), 1)
+                                                                    AS pct_cancelled
+  FROM obs_dashboard d
+  LEFT JOIN routes r ON r.route_id     = d.route_id
+                    AND r.feed_version = d.feed_version
+  LEFT JOIN agency a ON a.agency_id    = d.agency_id
+ GROUP BY 1, 2, 3, 4, 5, 6, 7;
+
+
+-- -----------------------------------------------------------------------------
+-- mv_route_hour — one row per route x day type x scheduled hour.
+-- Feeds panel 2 (route x hour heatmap).
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_route_hour AS
+SELECT agency_id,
+       route_id,
+       feed_version,
+       day_type,
+       sched_hour,
+       period,
+       COUNT(*)                                                     AS observations,
+       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delay_secs))::NUMERIC
+             / 60.0, 1)                                             AS median_delay_min,
+       ROUND((PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY delay_secs))::NUMERIC
+             / 60.0, 1)                                             AS p90_delay_min,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE on_time) / COUNT(*), 1) AS pct_on_time
+  FROM obs_dashboard
+ WHERE scored
+ GROUP BY 1, 2, 3, 4, 5, 6;
+
+
+-- -----------------------------------------------------------------------------
+-- mv_daily_agency — one row per agency x service date.
+-- Feeds panel 3 (delay over time).
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_daily_agency AS
+SELECT d.agency_id,
+       a.agency_name,
+       d.service_date,
+       d.day_type,
+       COUNT(*) FILTER (WHERE d.scored)                             AS observations,
+       COUNT(*) FILTER (WHERE d.schedule_relationship = 3)          AS cancelled,
+       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.delay_secs)
+              FILTER (WHERE d.scored))::NUMERIC / 60.0, 1)          AS median_delay_min,
+       ROUND((PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY d.delay_secs)
+              FILTER (WHERE d.scored))::NUMERIC / 60.0, 1)          AS p90_delay_min,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE d.scored AND d.on_time)
+             / NULLIF(COUNT(*) FILTER (WHERE d.scored), 0), 1)      AS pct_on_time
+  FROM obs_dashboard d
+  LEFT JOIN agency a ON a.agency_id = d.agency_id
+ GROUP BY 1, 2, 3, 4;
+
+
+-- -----------------------------------------------------------------------------
+-- mv_headway — headway reliability and bunching, one row per
+-- route x day type x scheduled hour.
+-- Feeds panel 4.
+--
+-- LAG pairs each arrival with the trip scheduled immediately before it at the
+-- same stop, in the same direction, on the same service day. Pairing in
+-- SCHEDULED order rather than observed order is what makes overtaking visible:
+-- when bus B passes bus A, B's actual headway behind A goes negative, which
+-- counts as bunched. In observed order the two would simply swap places and
+-- both look normal.
+--
+-- Known undercount: a cancelled or unobserved trip is absent, so the trips on
+-- either side of it pair with each other at roughly double the scheduled
+-- headway. Usually that lands above the 15-minute cutoff and drops out, so
+-- the gaps riders feel most are partly missing here — they show up instead as
+-- pct_cancelled and unobserved in mv_route_summary.
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_headway AS
+WITH paired AS (
+    SELECT agency_id,
+           route_id,
+           feed_version,
+           day_type,
+           sched_hour,
+           period,
+           EXTRACT(EPOCH FROM scheduled_arrival_time
+                   - LAG(scheduled_arrival_time) OVER w)            AS sched_headway_secs,
+           EXTRACT(EPOCH FROM observed_arrival_time
+                   - LAG(observed_arrival_time)  OVER w)            AS actual_headway_secs
+      FROM obs_dashboard
+     WHERE scored
+       AND direction_id IS NOT NULL
+    WINDOW w AS (PARTITION BY route_id, feed_version, direction_id,
+                              to_stop_id, service_date
+                     ORDER BY scheduled_arrival_time)
+)
+SELECT agency_id,
+       route_id,
+       feed_version,
+       day_type,
+       sched_hour,
+       period,
+       COUNT(*)                                                     AS headways,
+       COUNT(*) FILTER (WHERE actual_headway_secs
+                              < 0.5 * sched_headway_secs)           AS bunched,
+       COUNT(*) FILTER (WHERE actual_headway_secs
+                              > 1.5 * sched_headway_secs)           AS gapped,
+       ROUND(AVG(sched_headway_secs)::NUMERIC / 60.0, 1)            AS avg_sched_headway_min,
+       ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (
+              ORDER BY actual_headway_secs / sched_headway_secs))::NUMERIC, 2)
+                                                                    AS median_headway_ratio
+  FROM paired
+ -- frequent service only; the lower bound also excludes two trips scheduled
+ -- at the same second, which would divide by zero above
+ WHERE sched_headway_secs BETWEEN 60 AND 900
+ GROUP BY 1, 2, 3, 4, 5, 6;
+
+
+-- -----------------------------------------------------------------------------
+-- mv_stop_delay — one row per stop x agency x day type, with coordinates.
+-- Feeds panel 5 (stop map), and is the stop-level input for the census-tract
+-- join behind the equity panels.
+--
+-- Aggregated before joining to stops, so the join touches ~20 K rows rather
+-- than 25.8 M. Inner join: a stop with no coordinates cannot go on a map, and
+-- how many observations that loses is Section 7 Q5's number.
+-- Restricted to location_type 0 (or blank, which means 0) so the map does not
+-- put pins on station entrances.
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_stop_delay AS
+WITH by_stop AS (
+    SELECT agency_id,
+           to_stop_id,
+           feed_version,
+           day_type,
+           COUNT(*)                                                 AS observations,
+           ROUND((PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delay_secs))::NUMERIC
+                 / 60.0, 1)                                         AS median_delay_min,
+           ROUND((PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY delay_secs))::NUMERIC
+                 / 60.0, 1)                                         AS p90_delay_min,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE on_time) / COUNT(*), 1)
+                                                                    AS pct_on_time
+      FROM obs_dashboard
+     WHERE scored
+     GROUP BY 1, 2, 3, 4
+)
+SELECT b.agency_id,
+       b.to_stop_id                                                 AS stop_id,
+       b.feed_version,
+       s.stop_name,
+       -- named latitude / longitude so Metabase recognizes them for its map
+       s.stop_lat::DOUBLE PRECISION                                 AS latitude,
+       s.stop_lon::DOUBLE PRECISION                                 AS longitude,
+       b.day_type,
+       b.observations,
+       b.median_delay_min,
+       b.p90_delay_min,
+       b.pct_on_time,
+       -- numbered so the bands sort in order in a legend
+       CASE WHEN b.median_delay_min <  1  THEN '1. early or under 1 min'
+            WHEN b.median_delay_min <  4  THEN '2. 1–4 min'
+            WHEN b.median_delay_min < 10  THEN '3. 4–10 min'
+            ELSE                               '4. 10+ min' END     AS delay_band
+  FROM by_stop b
+  JOIN stops s ON s.stop_id      = b.to_stop_id
+              AND s.feed_version = b.feed_version
+ WHERE COALESCE(s.location_type, 0) = 0
+   AND s.stop_lat IS NOT NULL
+   AND s.stop_lon IS NOT NULL;
+
+
+ANALYZE mv_route_summary;
+ANALYZE mv_route_hour;
+ANALYZE mv_daily_agency;
+ANALYZE mv_headway;
+ANALYZE mv_stop_delay;
+
+
+-- =============================================================================
+-- SECTION 9 — dashboard panel queries (reliability, panels 1–5)
+--
+-- The SQL behind each panel, as pasted into Metabase's SQL editor. Each reads
+-- a Section 8 view, so each returns in well under a second.
+--
+-- Dashboard filters: to make a panel respond to a Metabase dashboard filter,
+-- add a variable to the saved question in Metabase, e.g.
+--     AND agency_id = {{agency}}
+-- Those are left out of this file because psql cannot parse {{ }}.
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 1. Worst bus routes by p90 delay, weekdays.
+-- Visualization: table, or a bar chart on p90_delay_min.
+--
+-- route_type = 3 for the reason given in Section 7 Q7: cable cars and long-
+-- layover intercity routes otherwise top the list for reasons that are not
+-- lateness. The volume floor keeps a route with a handful of bad trips off it.
+-- -----------------------------------------------------------------------------
+
+SELECT route_label,
+       agency_name,
+       observations,
+       median_delay_min,
+       p90_delay_min,
+       pct_on_time,
+       pct_cancelled
+  FROM mv_route_summary
+ WHERE day_type = 'weekday'
+   AND route_type = 3
+   AND observations >= 20000
+ ORDER BY p90_delay_min DESC
+ LIMIT 15;
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 2. Route x hour heatmap — p90 delay by scheduled hour, weekdays, for
+-- the 15 routes on the panel 1 leaderboard.
+-- Visualization: Metabase has no heatmap chart type; use a Pivot Table
+-- (rows = route, columns = hour, values = p90_delay_min) with conditional
+-- formatting as a color range.
+--
+-- The per-cell floor stops a single late-night trip from painting a cell red.
+-- -----------------------------------------------------------------------------
+
+WITH worst AS (
+    SELECT agency_id, route_id, feed_version, route_label
+      FROM mv_route_summary
+     WHERE day_type = 'weekday'
+       AND route_type = 3
+       AND observations >= 20000
+     ORDER BY p90_delay_min DESC
+     LIMIT 15
+)
+SELECT w.agency_id || ' ' || w.route_label                          AS route,
+       h.sched_hour                                                 AS hour,
+       h.p90_delay_min
+  FROM worst w
+  JOIN mv_route_hour h ON h.route_id     = w.route_id
+                      AND h.feed_version = w.feed_version
+ WHERE h.day_type = 'weekday'
+   AND h.observations >= 200
+ ORDER BY route, hour;
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 3. Delay over time — daily p90 delay for the five largest agencies.
+-- Visualization: line chart, x = service_date, y = p90_delay_min,
+-- series = agency_name.
+--
+-- Weekends are left in, since a weekly rhythm is part of what the chart shows.
+-- -----------------------------------------------------------------------------
+
+SELECT service_date,
+       agency_name,
+       median_delay_min,
+       p90_delay_min,
+       pct_on_time
+  FROM mv_daily_agency
+ WHERE agency_id IN (SELECT agency_id
+                       FROM mv_daily_agency
+                      GROUP BY agency_id
+                      ORDER BY SUM(observations) DESC
+                      LIMIT 5)
+ ORDER BY service_date, agency_name;
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 4. Headway reliability — the bus routes that bunch most, weekdays,
+-- frequent service only. The LAG window function behind it is in mv_headway.
+-- Visualization: stacked bar chart, pct_bunched and pct_gapped by route.
+--
+-- Percentages are rebuilt from the stored counts, which is why mv_headway
+-- keeps counts rather than per-hour rates.
+-- -----------------------------------------------------------------------------
+
+SELECT s.agency_id || ' ' || s.route_label                          AS route,
+       SUM(h.headways)                                              AS headways,
+       ROUND(100.0 * SUM(h.bunched) / SUM(h.headways), 1)           AS pct_bunched,
+       ROUND(100.0 * SUM(h.gapped)  / SUM(h.headways), 1)           AS pct_gapped
+  FROM mv_headway h
+  JOIN mv_route_summary s ON s.route_id     = h.route_id
+                         AND s.feed_version = h.feed_version
+                         AND s.day_type     = h.day_type
+ WHERE h.day_type = 'weekday'
+   AND s.route_type = 3
+ GROUP BY 1
+HAVING SUM(h.headways) >= 5000
+ ORDER BY pct_bunched DESC
+ LIMIT 15;
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 5. Stop map — weekday median delay at every stop.
+-- Visualization: map, using latitude / longitude. delay_band is there to
+-- color or filter by, since a pin map colors every pin the same.
+--
+-- The floor drops stops with too few weekday observations for a median to mean
+-- anything.
+-- -----------------------------------------------------------------------------
+
+SELECT stop_name,
+       latitude,
+       longitude,
+       agency_id,
+       observations,
+       median_delay_min,
+       p90_delay_min,
+       delay_band
+  FROM mv_stop_delay
+ WHERE day_type = 'weekday'
+   AND observations >= 100;
