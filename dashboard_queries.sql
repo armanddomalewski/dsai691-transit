@@ -27,7 +27,7 @@
 -- lateness. The volume floor keeps a route with a handful of bad trips off it.
 -- -----------------------------------------------------------------------------
 
-SELECT route_label,
+SELECT agency_id || ' ' || route_label                          AS route,
        agency_name,
        observations,
        median_delay_min,
@@ -45,31 +45,64 @@ SELECT route_label,
 -- -----------------------------------------------------------------------------
 -- Panel 2. Route x hour heatmap — p90 delay by scheduled hour, weekdays, for
 -- the 15 routes on the panel 1 leaderboard.
--- Visualization: Metabase has no heatmap chart type; use a Pivot Table
--- (rows = route, columns = hour, values = p90_delay_min) with conditional
--- formatting as a color range.
+-- Visualization: Table, with conditional formatting as a color range across
+-- the hour columns. Metabase has no heatmap chart type, and its Pivot Table
+-- only works on query-builder questions, not SQL — so the pivot is done here,
+-- one column per scheduled hour (24-hour clock), and the table does the rest.
 --
--- The per-cell floor stops a single late-night trip from painting a cell red.
+-- Rows are in leaderboard order, worst first. A blank cell means the route
+-- does not run that hour, or ran too few trips to score: the per-cell floor
+-- stops a single late-night trip from painting a cell red.
 -- -----------------------------------------------------------------------------
 
 WITH worst AS (
-    SELECT agency_id, route_id, feed_version, route_label
+    SELECT agency_id, route_id, feed_version, route_label, p90_delay_min
       FROM mv_route_summary
      WHERE day_type = 'weekday'
        AND route_type = 3
        AND observations >= 20000
      ORDER BY p90_delay_min DESC
      LIMIT 15
+),
+cells AS (
+    SELECT h.route_id, h.feed_version, h.sched_hour, h.p90_delay_min
+      FROM mv_route_hour h
+      JOIN worst w ON w.route_id     = h.route_id
+                  AND w.feed_version = h.feed_version
+     WHERE h.day_type = 'weekday'
+       AND h.observations >= 200
 )
 SELECT w.agency_id || ' ' || w.route_label                          AS route,
-       h.sched_hour                                                 AS hour,
-       h.p90_delay_min
+       w.p90_delay_min                                              AS "all day",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  0)        AS "00",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  1)        AS "01",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  2)        AS "02",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  3)        AS "03",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  4)        AS "04",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  5)        AS "05",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  6)        AS "06",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  7)        AS "07",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  8)        AS "08",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour =  9)        AS "09",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 10)        AS "10",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 11)        AS "11",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 12)        AS "12",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 13)        AS "13",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 14)        AS "14",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 15)        AS "15",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 16)        AS "16",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 17)        AS "17",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 18)        AS "18",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 19)        AS "19",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 20)        AS "20",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 21)        AS "21",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 22)        AS "22",
+       MAX(c.p90_delay_min) FILTER (WHERE c.sched_hour = 23)        AS "23"
   FROM worst w
-  JOIN mv_route_hour h ON h.route_id     = w.route_id
-                      AND h.feed_version = w.feed_version
- WHERE h.day_type = 'weekday'
-   AND h.observations >= 200
- ORDER BY route, hour;
+  LEFT JOIN cells c ON c.route_id     = w.route_id
+                   AND c.feed_version = w.feed_version
+ GROUP BY w.agency_id, w.route_label, w.p90_delay_min
+ ORDER BY w.p90_delay_min DESC;
 
 
 -- -----------------------------------------------------------------------------
@@ -101,6 +134,9 @@ SELECT service_date,
 --
 -- Percentages are rebuilt from the stored counts, which is why mv_headway
 -- keeps counts rather than per-hour rates.
+--
+-- LIMIT 10 because Metabase's row chart folds anything past ten rows into an
+-- "Other" bar that sums the percentages, which is meaningless.
 -- -----------------------------------------------------------------------------
 
 SELECT s.agency_id || ' ' || s.route_label                          AS route,
@@ -116,7 +152,7 @@ SELECT s.agency_id || ' ' || s.route_label                          AS route,
  GROUP BY 1
 HAVING SUM(h.headways) >= 5000
  ORDER BY pct_bunched DESC
- LIMIT 15;
+ LIMIT 10;
 
 
 -- -----------------------------------------------------------------------------
@@ -138,4 +174,5 @@ SELECT stop_name,
        delay_band
   FROM mv_stop_delay
  WHERE day_type = 'weekday'
-   AND observations >= 100;
+   AND observations >= 100
+   AND median_delay_min >= 4;
