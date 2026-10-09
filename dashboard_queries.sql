@@ -275,3 +275,51 @@ SELECT 'Q' || q.quintile
  GROUP BY q.quintile
  ORDER BY q.quintile;
 
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 8
+-- -----------------------------------------------------------------------------
+
+ SELECT o.agency_id,
+       a.agency_name,
+       COUNT(*)                                             AS observations,
+       COUNT(*) FILTER (WHERE o.schedule_relationship = 3)  AS cancelled,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE o.schedule_relationship = 3)
+             / COUNT(*), 2)                                 AS pct_cancelled
+  FROM stop_observations o
+  LEFT JOIN agency a ON a.agency_id = o.agency_id
+ GROUP BY 1, 2
+ ORDER BY observations DESC;
+
+
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 9
+-- -----------------------------------------------------------------------------
+
+SELECT o.agency_id,
+       a.agency_name,
+       COUNT(*) AS scheduled_obs,
+       ROUND(
+           100.0 * COUNT(*) FILTER (
+               WHERE o.observed_arrival_time = o.scheduled_arrival_time
+           ) / COUNT(*),
+           3
+       ) AS pct_exact_second_match
+  FROM stop_observations o
+  LEFT JOIN agency a
+    ON a.agency_id = o.agency_id
+ WHERE o.schedule_relationship = 0
+   AND o.observed_arrival_time IS NOT NULL
+   AND o.scheduled_arrival_time IS NOT NULL
+ GROUP BY o.agency_id, a.agency_name
+HAVING COUNT(*) >= 10000
+ ORDER BY pct_exact_second_match DESC;
+
