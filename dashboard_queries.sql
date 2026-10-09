@@ -1,16 +1,18 @@
 -- =============================================================================
 -- dashboard_queries.sql
 -- DSAI 691 — Relational Databases — Group Project, Task 3
--- Reliability dashboard panels 1–5
+-- Reliability dashboard panels 1–5, equity panels 6–8
 --
 -- The SQL behind each panel. Each query is pasted into Metabase's SQL editor
 -- and saved as a question in "Our analytics". This file is the record of them;
 -- it is not run as a script.
 --
--- Every query reads a view built by create_and_load.sql Section 8, so that
+-- Panels 1–7 read views built by create_and_load.sql Section 8, so that
 -- section must have been run first, or these fail with
 -- "relation mv_... does not exist". Reading the views is also what makes each
--- panel return in under a second instead of scanning 25.8 M rows.
+-- panel return in under a second instead of scanning 25.8 M rows. Panels 6–8
+-- also need census_tracts.sql and stop_tract_mapping.sql loaded. Panel 8 is
+-- the exception that reads stop_observations directly — see its note.
 --
 -- Dashboard filters: to make a panel respond to a Metabase dashboard filter,
 -- add a variable to the saved question in Metabase, e.g.
@@ -176,3 +178,148 @@ SELECT stop_name,
  WHERE day_type = 'weekday'
    AND observations >= 100
    AND median_delay_min >= 4;
+
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Panel 6. Income vs. delay, binned — the scatter's trend without the cloud.
+-- Visualization: bar chart (or line), x = income_band, y = avg_p90_delay_min
+-- and avg_median_delay_min.
+--
+-- $25k bands of tract median household income. The last band is the ACS
+-- top-code, 250,000+. Same tracts and same floor as panel 6; delay is
+-- weighted by observations across every stop in the band, so a band's
+-- number is the rider's-eye average, not an average of tract averages.
+-- -----------------------------------------------------------------------------
+
+WITH bus_agency AS (
+    SELECT agency_id
+      FROM mv_route_summary
+     WHERE agency_id NOT IN ('')        -- panel 9 exclusions go here
+     GROUP BY agency_id
+    HAVING BOOL_OR(route_type = 3)
+),
+tract AS (
+    SELECT c.geoid,
+           LEAST(FLOOR(c.median_household_income / 25000) * 25000, 250000)::INTEGER
+                                                                    AS band_start,
+           SUM(d.p90_delay_min    * d.observations)                 AS p90_weighted,
+           SUM(d.median_delay_min * d.observations)                 AS median_weighted,
+           SUM(d.observations)                                      AS observations
+      FROM mv_stop_delay d
+      JOIN bus_agency b         ON b.agency_id = d.agency_id
+      JOIN stop_tract_mapping m ON m.stop_id   = d.stop_id
+      JOIN census_tracts c      ON c.geoid     = m.geoid
+     WHERE d.day_type = 'weekday'
+       AND c.median_household_income IS NOT NULL
+       AND c.total_households > 0
+     GROUP BY c.geoid, c.median_household_income
+    HAVING SUM(d.observations) >= 2000
+)
+SELECT CASE WHEN band_start = 250000 THEN '$250k+'
+            ELSE '$' || (band_start / 1000) || '–'
+                 || ((band_start + 25000) / 1000) || 'k' END        AS income_band,
+       COUNT(*)                                                     AS tracts,
+       SUM(observations)                                            AS observations,
+       ROUND(SUM(p90_weighted)    / SUM(observations), 1)           AS avg_p90_delay_min,
+       ROUND(SUM(median_weighted) / SUM(observations), 1)           AS avg_median_delay_min
+  FROM tract
+ GROUP BY band_start
+ ORDER BY band_start;
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 7. Delay by vehicle-access quintile, weekdays.
+-- Visualization: bar chart, x = quintile_label, y = avg_median_delay_min and
+-- avg_p90_delay_min side by side.
+--
+-- Quintiles of zero_vehicle_pct, the share of households with no car.
+-- Q1 = the fewest car-free households, Q5 = the most car-free, i.e. least
+-- able to fall back on a car. The question is whether bars rise toward Q5.
+-- -----------------------------------------------------------------------------
+
+WITH bus_agency AS (
+    SELECT agency_id
+      FROM mv_route_summary
+     WHERE agency_id NOT IN ('')
+     GROUP BY agency_id
+    HAVING BOOL_OR(route_type = 3)
+),
+q AS (
+    SELECT geoid,
+           zero_vehicle_pct,
+           NTILE(5) OVER (ORDER BY zero_vehicle_pct, geoid)         AS quintile
+      FROM census_tracts
+     WHERE total_households > 0
+       AND zero_vehicle_pct IS NOT NULL
+)
+SELECT 'Q' || q.quintile
+       || CASE q.quintile WHEN 1 THEN ' (most car access)'
+                          WHEN 5 THEN ' (least car access)'
+                          ELSE '' END                               AS quintile_label,
+       ROUND(MIN(q.zero_vehicle_pct), 1) || '–'
+           || ROUND(MAX(q.zero_vehicle_pct), 1) || '%'              AS zero_vehicle_range,
+       COUNT(DISTINCT q.geoid)                                      AS tracts,
+       SUM(d.observations)                                          AS observations,
+       ROUND(SUM(d.median_delay_min * d.observations)
+             / SUM(d.observations), 1)                              AS avg_median_delay_min,
+       ROUND(SUM(d.p90_delay_min * d.observations)
+             / SUM(d.observations), 1)                              AS avg_p90_delay_min,
+       ROUND(SUM(d.pct_on_time * d.observations)
+             / SUM(d.observations), 1)                              AS pct_on_time
+  FROM mv_stop_delay d
+  JOIN bus_agency b ON b.agency_id = d.agency_id
+  JOIN stop_tract_mapping m ON m.stop_id   = d.stop_id
+  JOIN q ON q.geoid     = m.geoid
+ WHERE d.day_type = 'weekday'
+ GROUP BY q.quintile
+ ORDER BY q.quintile;
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 8
+-- -----------------------------------------------------------------------------
+
+ SELECT o.agency_id,
+       a.agency_name,
+       COUNT(*)                                             AS observations,
+       COUNT(*) FILTER (WHERE o.schedule_relationship = 3)  AS cancelled,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE o.schedule_relationship = 3)
+             / COUNT(*), 2)                                 AS pct_cancelled
+  FROM stop_observations o
+  LEFT JOIN agency a ON a.agency_id = o.agency_id
+ GROUP BY 1, 2
+ ORDER BY observations DESC;
+
+
+
+
+
+
+
+-- -----------------------------------------------------------------------------
+-- Panel 9
+-- -----------------------------------------------------------------------------
+
+SELECT o.agency_id,
+       a.agency_name,
+       COUNT(*) AS scheduled_obs,
+       ROUND(
+           100.0 * COUNT(*) FILTER (
+               WHERE o.observed_arrival_time = o.scheduled_arrival_time
+           ) / COUNT(*),
+           3
+       ) AS pct_exact_second_match
+  FROM stop_observations o
+  LEFT JOIN agency a
+    ON a.agency_id = o.agency_id
+ WHERE o.schedule_relationship = 0
+   AND o.observed_arrival_time IS NOT NULL
+   AND o.scheduled_arrival_time IS NOT NULL
+ GROUP BY o.agency_id, a.agency_name
+HAVING COUNT(*) >= 10000
+ ORDER BY pct_exact_second_match DESC;
+
