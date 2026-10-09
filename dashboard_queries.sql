@@ -341,25 +341,8 @@ SELECT 'Q' || q.quintile
 -- opened occasionally but is why they are not built the way panels 1–8 are.
 -- -----------------------------------------------------------------------------
 
--- Panel 9a. Coverage and cancellation rate by agency.
--- Visualization: table.
--- The coverage finding: BART reports ~69 K observations for the month against
--- Muni's ~9.8 M despite running hundreds of trips a day — it is barely
--- reporting, which is why the equity analysis runs on bus operators.
-
-SELECT o.agency_id,
-       a.agency_name,
-       COUNT(*)                                             AS observations,
-       COUNT(*) FILTER (WHERE o.schedule_relationship = 3)  AS cancelled,
-       ROUND(100.0 * COUNT(*) FILTER (WHERE o.schedule_relationship = 3)
-             / COUNT(*), 2)                                 AS pct_cancelled
-  FROM stop_observations o
-  LEFT JOIN agency a ON a.agency_id = o.agency_id
- GROUP BY 1, 2
- ORDER BY observations DESC;
-
-
--- Panel 9b. Schedule-echo detector.
+-- Panel 9a. Data check: arrivals logged exactly on schedule, by agency.
+-- (The schedule-echo detector.)
 -- Visualization: row chart, pct_exact_second_match by agency.
 -- A real vehicle essentially never arrives at its exact scheduled second.
 -- When an agency loses vehicle tracking, some prediction engines fall back to
@@ -381,3 +364,21 @@ SELECT o.agency_id,
  GROUP BY o.agency_id, a.agency_name
 HAVING COUNT(*) >= 10000
  ORDER BY pct_exact_second_match DESC;
+
+
+-- Panel 9b. Data check: observations and cancellations, by agency.
+-- Visualization: table.
+-- The coverage finding: BART reports ~69 K observations for the month against
+-- Muni's ~9.8 M despite running hundreds of trips a day — it is barely
+-- reporting, which is why the equity analysis runs on bus operators.
+
+SELECT o.agency_id,
+       a.agency_name,
+       COUNT(*)                                             AS observations,
+       COUNT(*) FILTER (WHERE o.schedule_relationship = 3)  AS cancelled,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE o.schedule_relationship = 3)
+             / COUNT(*), 2)                                 AS pct_cancelled
+  FROM stop_observations o
+  LEFT JOIN agency a ON a.agency_id = o.agency_id
+ GROUP BY 1, 2
+ ORDER BY observations DESC;
