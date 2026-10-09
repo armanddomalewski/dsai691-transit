@@ -7,12 +7,13 @@
 -- and saved as a question in "Our analytics". This file is the record of them;
 -- it is not run as a script.
 --
--- Panels 1–7 read views built by create_and_load.sql Section 8, so that
+-- Panels 1–8 read views built by create_and_load.sql Section 8, so that
 -- section must have been run first, or these fail with
 -- "relation mv_... does not exist". Reading the views is also what makes each
 -- panel return in under a second instead of scanning 25.8 M rows. Panels 6–8
--- also need census_tracts.sql and stop_tract_mapping.sql loaded. Panel 8 is
--- the exception that reads stop_observations directly — see its note.
+-- also need census_tracts.sql and stop_tract_mapping.sql loaded. Panel 9, the
+-- data-quality audit, is the exception that reads stop_observations directly —
+-- see its note.
 --
 -- Dashboard filters: to make a panel respond to a Metabase dashboard filter,
 -- add a variable to the saved question in Metabase, e.g.
@@ -182,14 +183,15 @@ SELECT stop_name,
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
--- Panel 6. Income vs. delay, binned — the scatter's trend without the cloud.
+-- Panel 6. Income vs. delay — weekday delay by band of tract income.
 -- Visualization: bar chart (or line), x = income_band, y = avg_p90_delay_min
 -- and avg_median_delay_min.
 --
 -- $25k bands of tract median household income. The last band is the ACS
--- top-code, 250,000+. Same tracts and same floor as panel 6; delay is
--- weighted by observations across every stop in the band, so a band's
--- number is the rider's-eye average, not an average of tract averages.
+-- top-code, 250,000+. Tracts with fewer than 2,000 weekday observations are
+-- dropped. Delay is weighted by observations across every stop in the band,
+-- so a band's number is the rider's-eye average, not an average of tract
+-- averages.
 -- -----------------------------------------------------------------------------
 
 WITH bus_agency AS (
@@ -276,14 +278,76 @@ SELECT 'Q' || q.quintile
  ORDER BY q.quintile;
 
 
+-- -----------------------------------------------------------------------------
+-- Panel 8. Cancellation rate by income quintile, weekdays.
+-- Visualization: bar chart, x = quintile_label, y = pct_cancelled.
+--
+-- Replaces the planned crowding-by-income panel: the 511 feed carries no
+-- occupancy data. A late bus has a delay; a cancelled bus has none and
+-- vanishes from every delay statistic, so this is the reliability failure
+-- panels 6 and 7 cannot see — and from a rider's side it is the worse one.
+--
+-- Same construction as panel 7: quintiles of tracts (here by median household
+-- income), bus agencies only, counts summed before dividing so each quintile's
+-- rate is the share of its scheduled stops that were cancelled.
+-- Reads mv_stop_cancellations from create_and_load.sql Section 8.
+-- -----------------------------------------------------------------------------
 
+WITH bus_agency AS (
+    SELECT agency_id
+      FROM mv_route_summary
+     WHERE agency_id NOT IN ('')        -- panel 9 exclusions go here
+     GROUP BY agency_id
+    HAVING BOOL_OR(route_type = 3)
+),
+q AS (
+    SELECT geoid,
+           median_household_income,
+           NTILE(5) OVER (ORDER BY median_household_income, geoid)  AS quintile
+      FROM census_tracts
+     WHERE total_households > 0
+       AND median_household_income IS NOT NULL
+)
+SELECT 'Q' || q.quintile
+       || CASE q.quintile WHEN 1 THEN ' (lowest income)'
+                          WHEN 5 THEN ' (highest income)'
+                          ELSE '' END                               AS quintile_label,
+       '$' || ROUND(MIN(q.median_household_income) / 1000) || 'k–$'
+           || ROUND(MAX(q.median_household_income) / 1000) || 'k'   AS income_range,
+       COUNT(DISTINCT q.geoid)                                      AS tracts,
+       SUM(x.scheduled)                                             AS scheduled_stops,
+       SUM(x.cancelled)                                             AS cancelled_stops,
+       ROUND(100.0 * SUM(x.cancelled) / NULLIF(SUM(x.scheduled), 0), 2)
+                                                                    AS pct_cancelled
+  FROM mv_stop_cancellations x
+  JOIN bus_agency b         ON b.agency_id = x.agency_id
+  JOIN stop_tract_mapping m ON m.stop_id   = x.stop_id
+  JOIN q                    ON q.geoid     = m.geoid
+ WHERE x.day_type = 'weekday'
+ GROUP BY q.quintile
+ ORDER BY q.quintile;
 
 
 -- -----------------------------------------------------------------------------
--- Panel 8
+-- Panel 9. Data-quality audit — two cards.
+--
+-- observed_arrival_time is inferred from each agency's realtime prediction
+-- feed, not measured, so feed quality varies by agency. This panel decides
+-- which agencies the other panels should trust; any agency it rules out goes
+-- in the bus_agency exclusion list in panels 6–8.
+--
+-- Both cards read stop_observations directly rather than a view. They scan
+-- all 25.8 M rows and take tens of seconds, which is acceptable for an audit
+-- opened occasionally but is why they are not built the way panels 1–8 are.
 -- -----------------------------------------------------------------------------
 
- SELECT o.agency_id,
+-- Panel 9a. Coverage and cancellation rate by agency.
+-- Visualization: table.
+-- The coverage finding: BART reports ~69 K observations for the month against
+-- Muni's ~9.8 M despite running hundreds of trips a day — it is barely
+-- reporting, which is why the equity analysis runs on bus operators.
+
+SELECT o.agency_id,
        a.agency_name,
        COUNT(*)                                             AS observations,
        COUNT(*) FILTER (WHERE o.schedule_relationship = 3)  AS cancelled,
@@ -295,31 +359,25 @@ SELECT 'Q' || q.quintile
  ORDER BY observations DESC;
 
 
-
-
-
-
-
--- -----------------------------------------------------------------------------
--- Panel 9
--- -----------------------------------------------------------------------------
+-- Panel 9b. Schedule-echo detector.
+-- Visualization: row chart, pct_exact_second_match by agency.
+-- A real vehicle essentially never arrives at its exact scheduled second.
+-- When an agency loses vehicle tracking, some prediction engines fall back to
+-- echoing the timetable, which looks like perfect on-time performance rather
+-- than missing data. A high share here means that agency's delays are
+-- understated — and if it serves lower-income areas, so is the equity gap.
 
 SELECT o.agency_id,
        a.agency_name,
-       COUNT(*) AS scheduled_obs,
-       ROUND(
-           100.0 * COUNT(*) FILTER (
-               WHERE o.observed_arrival_time = o.scheduled_arrival_time
-           ) / COUNT(*),
-           3
-       ) AS pct_exact_second_match
+       COUNT(*)                                             AS scheduled_obs,
+       ROUND(100.0 * COUNT(*) FILTER (
+             WHERE o.observed_arrival_time = o.scheduled_arrival_time)
+             / COUNT(*), 3)                                 AS pct_exact_second_match
   FROM stop_observations o
-  LEFT JOIN agency a
-    ON a.agency_id = o.agency_id
+  LEFT JOIN agency a ON a.agency_id = o.agency_id
  WHERE o.schedule_relationship = 0
-   AND o.observed_arrival_time IS NOT NULL
+   AND o.observed_arrival_time  IS NOT NULL
    AND o.scheduled_arrival_time IS NOT NULL
  GROUP BY o.agency_id, a.agency_name
 HAVING COUNT(*) >= 10000
  ORDER BY pct_exact_second_match DESC;
-

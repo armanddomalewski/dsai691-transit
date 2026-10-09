@@ -692,7 +692,7 @@ HAVING COUNT(*) > 20000
 -- =============================================================================
 -- SECTION 8 — dashboard layer: metric definitions and pre-aggregated rollups
 --
--- Reliability panels 1–5.
+-- Reliability panels 1–5, plus the cancellation rollup behind equity panel 8.
 --
 -- Metabase runs every panel query live, and a percentile over 25.8 M rows takes
 -- far too long for a dashboard. So the expensive work happens here, once, at
@@ -750,6 +750,7 @@ DROP MATERIALIZED VIEW IF EXISTS mv_headway;
 DROP MATERIALIZED VIEW IF EXISTS mv_daily_agency;
 DROP MATERIALIZED VIEW IF EXISTS mv_route_hour;
 DROP MATERIALIZED VIEW IF EXISTS mv_route_summary;
+DROP MATERIALIZED VIEW IF EXISTS mv_stop_cancellations;
 DROP VIEW              IF EXISTS obs_dashboard;
 
 
@@ -999,9 +1000,36 @@ SELECT b.agency_id,
    AND s.stop_lon IS NOT NULL;
 
 
+-- -----------------------------------------------------------------------------
+-- mv_stop_cancellations — scheduled and cancelled stops, one row per
+-- stop x agency x day type.
+-- Feeds panel 8 (cancellation rate by tract income).
+--
+-- Without it, panel 8 has to scan every observation through obs_dashboard on
+-- each dashboard load, which took well over a minute in testing. Counts, not
+-- rates, so they can be summed up to any grouping (tract, income quintile).
+-- The denominator matches pct_cancelled in mv_route_summary: rows that were
+-- either scheduled (0) or cancelled (3); added trips (1) are excluded.
+--
+-- Dropped above, before obs_dashboard, because it depends on obs_dashboard:
+-- Postgres refuses to drop a view that another object is built on.
+-- -----------------------------------------------------------------------------
+
+CREATE MATERIALIZED VIEW mv_stop_cancellations AS
+SELECT agency_id,
+       to_stop_id                                                   AS stop_id,
+       feed_version,
+       day_type,
+       COUNT(*) FILTER (WHERE schedule_relationship IN (0, 3))      AS scheduled,
+       COUNT(*) FILTER (WHERE schedule_relationship = 3)            AS cancelled
+  FROM obs_dashboard
+ GROUP BY 1, 2, 3, 4;
+
+
 ANALYZE mv_route_summary;
 ANALYZE mv_route_hour;
 ANALYZE mv_daily_agency;
 ANALYZE mv_headway;
 ANALYZE mv_stop_delay;
+ANALYZE mv_stop_cancellations;
 

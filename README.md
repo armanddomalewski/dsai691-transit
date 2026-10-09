@@ -52,14 +52,22 @@ curl -L -C - -o rg-2026-08-so.zip \
 unzip -o rg-2026-08-so.zip agency.txt routes.txt trips.txt stops.txt stop_observations.txt
 cd ..
 
-# 4. build everything
-docker exec -i postgres psql -U transit -d postgres < create_and_load.sql
+# 4. build everything — all three files, in this order, as one psql session
+cat create_and_load.sql census_tracts.sql stop_tract_mapping.sql \
+  | docker exec -i postgres psql -U transit -d postgres
 ```
 
 Note `-d postgres`, not `-d transit`: the script drops and recreates the
-`transit` database, which cannot be done from inside it.
+`transit` database, which cannot be done from inside it. Its `\c transit` line
+then switches the session into the new database, which is why the census files
+must be piped through the same session rather than run separately against
+`postgres`.
 
-Runs in about **9 minutes** on 4 vCPU / 16 GB. Metabase is then at
+**Run all three files.** `create_and_load.sql` drops the whole database, so
+running it alone deletes the census tables, and the equity panels (6–8) break.
+
+The load itself takes about **9 minutes** on 4 vCPU / 16 GB; Section 8's
+dashboard rollups add more on top. Metabase is then at
 `http://localhost:3000`; connect it to host `postgres`, port 5432, database
 `transit`.
 
@@ -150,7 +158,10 @@ finding shrinks for reasons unrelated to service quality.
 
 | File | Purpose |
 | :-- | :-- |
-| `create_and_load.sql` | Creates the database, all tables, loads the archive, and runs validation queries. The whole pipeline. |
+| `create_and_load.sql` | Creates the database, all tables, loads the archive, runs validation queries, and builds the dashboard views (Section 8). |
+| `census_tracts.sql` | ACS income and vehicle-availability data for 1,772 Bay Area tracts, with TIGER boundaries. Run after `create_and_load.sql`. |
+| `stop_tract_mapping.sql` | Which census tract each stop falls in. Run after `create_and_load.sql`. |
+| `dashboard_queries.sql` | The SQL behind each Metabase panel, 1–9. A record, not a script. |
 | `compose.yaml` | Postgres (with PostGIS) and Metabase. Postgres is deliberately not exposed to the internet. |
 | `.env.example` | Required environment variables. Copy to `.env`, which is gitignored. |
 
